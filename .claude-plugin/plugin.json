@@ -1,0 +1,8 @@
+{
+  "name": "claude-auto-resume",
+  "description": "Auto-resume Claude Code sessions after a usage/session limit: watches the transcript for 'You've hit your session limit · resets HH:MM (tz)', waits until reset + delay, then relaunches `claude --resume` so background agents pick their work back up. Zero dependencies, no AI.",
+  "version": "1.0.0",
+  "author": { "name": "wetson3234" },
+  "homepage": "https://github.com/wetson3234/claude-auto-resume",
+  "license": "MIT"
+}
