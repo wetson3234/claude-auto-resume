@@ -156,6 +156,28 @@ log(`démarré — surveille ${TRANSCRIPT} (delay +${DELAY_MIN} min, mode ${MODE
 notify('Claude auto-resume ✅', `Watcher actif — surveille la session ${path.basename(TRANSCRIPT, '.jsonl').slice(0, 8)}… (reprise auto à reset+${DELAY_MIN} min)`);
 
 setInterval(() => {
+  // Mode --project-dir : suit TOUJOURS la session la plus récente (les reprises
+  // headless/Telegram créent de nouveaux fichiers .jsonl — il faut basculer).
+  if (PROJECT_DIR) {
+    try {
+      const newest = newestJsonl(PROJECT_DIR);
+      if (newest && newest !== TRANSCRIPT) {
+        TRANSCRIPT = newest;
+        // On repart de la fin du nouveau fichier, avec un scan unique de sa
+        // queue (4 Ko) pour attraper un run qui vient de mourir sur une limite.
+        const st = fs.statSync(TRANSCRIPT);
+        lastSize = st.size;
+        carry = '';
+        log(`bascule sur la session la plus récente : ${path.basename(TRANSCRIPT)}`);
+        const fdT = fs.openSync(TRANSCRIPT, 'r');
+        const tailLen = Math.min(4096, st.size);
+        const tailBuf = Buffer.alloc(tailLen);
+        fs.readSync(fdT, tailBuf, 0, tailLen, st.size - tailLen);
+        fs.closeSync(fdT);
+        carry = tailBuf.toString('utf8'); // sera scanné avec le prochain chunk
+      }
+    } catch { /* best-effort */ }
+  }
   let size;
   try { size = fs.statSync(TRANSCRIPT).size; } catch { return; }
   if (size < lastSize) { lastSize = 0; carry = ''; } // fichier tronqué/rotaté
