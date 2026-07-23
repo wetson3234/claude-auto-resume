@@ -52,6 +52,26 @@ function log(msg) {
   try { fs.appendFileSync(path.join(path.dirname(TRANSCRIPT || '.'), 'auto-resume.log'), line + '\n'); } catch { /* best-effort */ }
 }
 
+/** Notification système (toast Windows via balloon tip ; notify-send sur Linux ; osascript sur macOS). */
+function notify(title, message) {
+  try {
+    if (process.platform === 'win32') {
+      const ps = `Add-Type -AssemblyName System.Windows.Forms;` +
+        `$n=New-Object System.Windows.Forms.NotifyIcon;` +
+        `$n.Icon=[System.Drawing.SystemIcons]::Information;$n.Visible=$true;` +
+        `$n.ShowBalloonTip(15000,'${title.replace(/'/g, "''")}','${message.replace(/'/g, "''")}','Info');` +
+        `Start-Sleep 16;$n.Dispose()`;
+      spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', ps],
+        { detached: true, stdio: 'ignore' }).unref();
+    } else if (process.platform === 'darwin') {
+      spawn('osascript', ['-e', `display notification "${message}" with title "${title}"`],
+        { detached: true, stdio: 'ignore' }).unref();
+    } else {
+      spawn('notify-send', [title, message], { detached: true, stdio: 'ignore' }).unref();
+    }
+  } catch { /* la notif ne doit jamais casser le watcher */ }
+}
+
 // ---------- transcript selection ----------
 function newestJsonl(dir) {
   const files = fs.readdirSync(dir)
@@ -78,13 +98,20 @@ function timeInTz(date, tz) {
   }
 }
 
-/** Next epoch-ms where wall clock in `tz` reads h:m (search ≤ 25 h, minute steps). */
+/**
+ * Epoch-ms cible pour h:m dans `tz`. Cherche d'abord dans le PASSÉ RÉCENT
+ * (≤ 20 min : le reset vient d'avoir lieu → reprise quasi immédiate), sinon
+ * la prochaine occurrence (≤ 25 h, pas d'une minute, DST-proof).
+ */
 function nextOccurrence(h, m, tz) {
   const start = new Date(Math.ceil(Date.now() / 60000) * 60000); // prochaine minute pleine
-  for (let i = 0; i <= 25 * 60; i++) {
+  for (let i = -20; i <= 25 * 60; i++) {
     const cand = new Date(start.getTime() + i * 60000);
     const t = timeInTz(cand, tz);
-    if (t.h === h && t.m === m) return cand.getTime();
+    if (t.h === h && t.m === m) {
+      // Occurrence déjà passée (reset récent) -> reprise dans 2 min.
+      return i <= 0 ? Date.now() + 2 * 60000 : cand.getTime();
+    }
   }
   return start.getTime() + 60 * 60000; // improbable : repli +1 h
 }
@@ -123,8 +150,10 @@ function resumeSession() {
 let lastSize = fs.statSync(TRANSCRIPT).size; // on ignore l'historique : seules les NOUVELLES limites comptent
 let carry = '';           // chevauchement entre lectures (motif à cheval sur 2 chunks)
 let pendingAt = null;     // epoch-ms du resume programmé
+let pendingTimer = null;  // handle du setTimeout (reprogrammable au plus tôt)
 
 log(`démarré — surveille ${TRANSCRIPT} (delay +${DELAY_MIN} min, mode ${MODE})`);
+notify('Claude auto-resume ✅', `Watcher actif — surveille la session ${path.basename(TRANSCRIPT, '.jsonl').slice(0, 8)}… (reprise auto à reset+${DELAY_MIN} min)`);
 
 setInterval(() => {
   let size;
@@ -144,14 +173,23 @@ setInterval(() => {
 
   const hit = parseLimit(text);
   if (!hit) return;
-  if (pendingAt) { log('limite détectée mais un resume est déjà programmé — ignoré'); return; }
 
   const target = nextOccurrence(hit.h, hit.min, hit.tz) + DELAY_MIN * 60000;
+  // Reprogrammation au PLUS TÔT : une nouvelle limite avec un reset plus proche
+  // remplace celle en attente (une détection parasite tardive ne bloque jamais
+  // la vraie ; une reprise "pour rien" est inoffensive et auto-corrigée).
+  if (pendingAt) {
+    if (target >= pendingAt - 60000) { log('limite détectée — resume déjà programmé plus tôt/égal, ignoré'); return; }
+    clearTimeout(pendingTimer);
+    log('limite détectée avec un reset PLUS TÔT — reprogrammation');
+  }
   pendingAt = target;
   const inMin = Math.round((target - Date.now()) / 60000);
-  log(`LIMITE détectée — reset ${String(hit.h).padStart(2, '0')}:${String(hit.min).padStart(2, '0')} (${hit.tz}) → resume dans ~${inMin} min`);
+  const localHHMM = new Date(target).toLocaleTimeString('fr-BE', { hour: '2-digit', minute: '2-digit' });
+  log(`LIMITE détectée — reset ${String(hit.h).padStart(2, '0')}:${String(hit.min).padStart(2, '0')} (${hit.tz}) → resume à ${localHHMM} (~${inMin} min)`);
+  notify('Claude auto-resume ⏳', `Limite atteinte — reprise automatique à ${localHHMM} (dans ~${inMin} min).`);
 
-  setTimeout(() => {
+  pendingTimer = setTimeout(() => {
     pendingAt = null;
     resumeSession();
     if (ONCE) { log('mode --once : arrêt.'); process.exit(0); }
