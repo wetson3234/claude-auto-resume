@@ -20,7 +20,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 
 // ---------- args ----------
 const argv = process.argv.slice(2);
@@ -37,6 +37,20 @@ const DELAY_MIN = Number(arg('delay-min', '5'));
 const MODE = arg('mode', 'headless'); // headless: claude -p ; window: new terminal (win32)
 const ONCE = has('once');
 const POLL_MS = 5000;
+
+/**
+ * Résolution du binaire claude : --claude-bin > env CLAUDE_BIN > `where/which claude`.
+ * LEÇON (incident réel) : supposer `claude.cmd` échoue sur les installs natives
+ * (claude.exe) -> 3 reprises nocturnes perdues en silence. On résout, on ne devine pas.
+ */
+function findClaudeBin() {
+  const explicit = arg('claude-bin') || process.env.CLAUDE_BIN;
+  if (explicit) return explicit;
+  const r = spawnSync(process.platform === 'win32' ? 'where' : 'which', ['claude'], { encoding: 'utf8' });
+  const line = (r.stdout || '').split(/\r?\n/).map((l) => l.trim()).find(Boolean);
+  return line || (process.platform === 'win32' ? 'claude.cmd' : 'claude');
+}
+const CLAUDE_BIN = findClaudeBin();
 
 const PROMPT = process.env.AUTO_RESUME_PROMPT
   || 'La limite de session est réinitialisée — reprends IMMÉDIATEMENT ton travail là où il s\'était arrêté : relance/reprends tous les agents interrompus (SendMessage avec leur id), puis continue la mission en cours sans attendre de confirmation.';
@@ -141,8 +155,18 @@ function resumeSession() {
     // Headless : la session reprend en arrière-plan et relance ses agents.
     const args = ['--resume', sessionId, '-p', PROMPT, ...EXTRA_ARGS];
     const out = fs.openSync(path.join(path.dirname(TRANSCRIPT), 'auto-resume-run.log'), 'a');
-    spawn(process.platform === 'win32' ? 'claude.cmd' : 'claude', args,
-      { cwd: CWD, detached: true, stdio: ['ignore', out, out], shell: process.platform === 'win32' }).unref();
+    const child = spawn(CLAUDE_BIN, args, { cwd: CWD, detached: true, stdio: ['ignore', out, out] });
+    // Un échec de reprise ne doit JAMAIS être silencieux : log + toast + retry unique.
+    child.on('exit', (code) => {
+      if (code === 0) { log('reprise terminée avec succès (exit 0)'); return; }
+      log(`ÉCHEC de la reprise (exit ${code}) — voir auto-resume-run.log`);
+      notify('Claude auto-resume ❌', `La reprise automatique a ÉCHOUÉ (exit ${code}). Nouvel essai dans 5 min.`);
+      setTimeout(() => { log('retry de la reprise…'); resumeSession(); }, 5 * 60000);
+    });
+    child.on('error', (e) => {
+      log(`ÉCHEC spawn reprise: ${e.message} (bin=${CLAUDE_BIN})`);
+      notify('Claude auto-resume ❌', `Impossible de lancer claude (${e.message}).`);
+    });
   }
 }
 
@@ -152,7 +176,7 @@ let carry = '';           // chevauchement entre lectures (motif à cheval sur 2
 let pendingAt = null;     // epoch-ms du resume programmé
 let pendingTimer = null;  // handle du setTimeout (reprogrammable au plus tôt)
 
-log(`démarré — surveille ${TRANSCRIPT} (delay +${DELAY_MIN} min, mode ${MODE})`);
+log(`démarré — surveille ${TRANSCRIPT} (delay +${DELAY_MIN} min, mode ${MODE}, claude=${CLAUDE_BIN})`);
 notify('Claude auto-resume ✅', `Watcher actif — surveille la session ${path.basename(TRANSCRIPT, '.jsonl').slice(0, 8)}… (reprise auto à reset+${DELAY_MIN} min)`);
 
 setInterval(() => {
