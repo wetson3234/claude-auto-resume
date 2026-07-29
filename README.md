@@ -67,6 +67,37 @@ On macOS/Linux the installer prints an equivalent cron line instead.
 - **Never-silent failures** — a failed resume is logged, toasted, and retried via a
   persisted schedule.
 
+## Notifications (optional, Telegram)
+
+Everything the watcher does is silent by default. To get pushed when something
+happens, create `~/.claude/auto-resume/notify.json` (**outside the repo** — this
+file holds your bot token and must never be committed):
+
+```json
+{
+  "telegram": {
+    "botToken": "123456789:ABC-your-bot-token",
+    "chatId": "123456789"
+  }
+}
+```
+
+- Get a bot token from [@BotFather](https://t.me/BotFather); your `chatId` is what
+  [@userinfobot](https://t.me/userinfobot) replies to you (send the bot a first
+  message so it is allowed to answer).
+- **File absent → strict no-op**: no notification, watcher behavior unchanged.
+- Events pushed: `⛔ Claude limit hit — resume scheduled at HH:MM (tz)
+  [model fallback: X]`, `▶️ Resuming session <id> (model)`,
+  `✅ Resume finished` / `❌ Resume failed (exit N)`.
+- **Best-effort**: a network or API failure is logged and swallowed — it never
+  breaks the watcher. Duplicate events within 60 s are sent once (anti-spam).
+
+Verify your setup with a real send:
+
+```bash
+node scripts/test-notify.mjs   # -> "🔔 Auto-resume notifications enabled" in Telegram
+```
+
 ## Options
 
 | Flag | Default | Description |
@@ -121,13 +152,15 @@ task above, which also survives reboots.
 ## Tests
 
 ```bash
-node --test test/detect.test.mjs
+node --test test/detect.test.mjs test/notify.test.mjs
 ```
 
 Covers the exact message from the 2026-07-28 incident (`weekly limit · resets 8pm`),
 EN/FR phrase variants, dynamic reset-time parsing (am/pm, 24h, `20h05`, weekday,
 timezone), real-event gating vs quotes, target-time computation across timezones,
-and the fallback chain.
+and the fallback chain. The notification tests (injected fetch/clock, no network)
+cover the absent-config no-op, message formatting, the Bot API call shape, the
+60 s dedup window, and best-effort failure handling (no throw, token never logged).
 
 ## Caveats
 
@@ -150,8 +183,9 @@ Code, détecte le vrai événement de limite (« You've hit your weekly/session 
 8pm (fuseau) », variantes FR incluses), lit l'heure du reset dynamiquement, attend
 reset + 5 min, puis relance `claude --resume` pour que tes agents reprennent le travail
 tout seuls. Planification persistée (survit veille/reboot via tâche planifiée), repli
-automatique vers un modèle inférieur en attendant le reset, et outils `--dry-run` /
-`--scan-only` pour tester sans rien lancer.
+automatique vers un modèle inférieur en attendant le reset, notifications Telegram
+optionnelles (opt-in via `~/.claude/auto-resume/notify.json`, hors repo), et outils
+`--dry-run` / `--scan-only` pour tester sans rien lancer.
 
 ## License
 

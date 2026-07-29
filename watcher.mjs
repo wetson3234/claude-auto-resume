@@ -23,6 +23,9 @@
  *     immediately resume on the next lower model tier (e.g. fable -> opus ->
  *     sonnet). The reset-time resume stays scheduled as a safety net and to
  *     restore the original model once the limit clears.
+ *   - Optional Telegram notifications (opt-in): if ~/.claude/auto-resume/notify.json
+ *     exists, key events (limit detected, resume launched, resume finished) are
+ *     pushed via the Telegram Bot API. Best-effort, deduplicated, never fatal.
  *
  * Pure Node.js, zero dependencies, no AI involved.
  *
@@ -53,6 +56,10 @@ import {
   limitEventOf, recordModel, nextOccurrence, modelTier, nextFallbackTier,
   DEFAULT_FALLBACK_CHAIN,
 } from './lib/detect.mjs';
+import {
+  loadNotifyConfig, createNotifier,
+  formatLimitDetected, formatResumeStarted, formatResumeFinished,
+} from './lib/notify.mjs';
 
 // ---------- args ----------
 const argv = process.argv.slice(2);
@@ -142,6 +149,13 @@ function notify(title, message) {
   } catch { /* a notification must never break the watcher */ }
 }
 
+/**
+ * Optional Telegram notifications — opt-in via ~/.claude/auto-resume/notify.json
+ * (outside the repo). File absent => no-op, behavior unchanged. Sends are
+ * best-effort and deduplicated (same event within 60 s -> one message).
+ */
+const telegram = createNotifier(loadNotifyConfig(), { log });
+
 // ---------- single-instance lock ----------
 const LOCK_FILE = PROJECT_DIR
   ? path.join(PROJECT_DIR, 'auto-resume.watcher.lock')
@@ -204,6 +218,7 @@ function resumeSession(model = null) {
     return;
   }
   log(`RESUME session ${sessionId} (cwd=${CWD}, mode=${MODE}${model ? `, model=${model}` : ''})`);
+  telegram.notify(formatResumeStarted(sessionId, model));
   if (MODE === 'window' && process.platform === 'win32') {
     // New interactive terminal window resuming the session with the prompt.
     const argList = ['--resume', sessionId, ...modelArgs, PROMPT];
@@ -218,6 +233,7 @@ function resumeSession(model = null) {
     const child = spawn(CLAUDE_BIN, args, { cwd: CWD, detached: true, stdio: ['ignore', out, out] });
     // A resume failure must NEVER be silent: log + toast + persisted retry.
     child.on('exit', (code) => {
+      telegram.notify(formatResumeFinished(code));
       if (code === 0) { log('resume finished successfully (exit 0)'); return; }
       log(`resume FAILED (exit ${code}) — see auto-resume-run.log`);
       notify('Claude auto-resume', `Automatic resume FAILED (exit ${code}). Retrying in 5 min.`);
@@ -226,6 +242,7 @@ function resumeSession(model = null) {
     child.on('error', (e) => {
       log(`resume spawn FAILED: ${e.message} (bin=${CLAUDE_BIN})`);
       notify('Claude auto-resume', `Could not launch claude (${e.message}).`);
+      telegram.notify('❌ Resume failed (could not launch claude)');
     });
   }
 }
@@ -272,12 +289,14 @@ function handleLimitEvent(ev, origin) {
   notify('Claude auto-resume', `Limit hit — resume scheduled at ${new Date(resetAt).toLocaleTimeString(undefined, { hour12: false })}.`);
 
   // Model fallback: don't wait — step down to the next lower tier immediately.
+  let fallbackTier = null;
   if (FALLBACK_ENABLED) {
     const { model, tier } = currentModelTier();
     const lastTried = state.episode.triedTiers[state.episode.triedTiers.length - 1] || null;
     const fromTier = lastTried || tier; // after a failed fallback, keep stepping down
     const next = nextFallbackTier(fromTier, CHAIN, state.episode.triedTiers);
     if (next) {
+      fallbackTier = next;
       state.episode.triedTiers.push(next);
       saveState();
       log(`model fallback: ${model || 'unknown model'} (tier ${fromTier || 'unknown'}) -> ${next} — resuming in 2 min instead of waiting`);
@@ -287,6 +306,9 @@ function handleLimitEvent(ev, origin) {
       log('model fallback: chain exhausted — waiting for the reset');
     }
   }
+  telegram.notify(formatLimitDetected({
+    resetAt, tz: ev.reset?.tz || LOCAL_TZ, fallbackModel: fallbackTier,
+  }));
   saveState();
 }
 
@@ -331,7 +353,7 @@ function catchUpScan() {
 }
 
 // ---------- startup ----------
-log(`started — watching ${TRANSCRIPT} (delay +${DELAY_MIN} min, mode ${MODE}, fallback ${FALLBACK_ENABLED ? CHAIN.join('>') : 'off'}, claude=${CLAUDE_BIN}${DRY_RUN ? ', DRY-RUN' : ''})`);
+log(`started — watching ${TRANSCRIPT} (delay +${DELAY_MIN} min, mode ${MODE}, fallback ${FALLBACK_ENABLED ? CHAIN.join('>') : 'off'}, telegram ${telegram.enabled ? 'on' : 'off'}, claude=${CLAUDE_BIN}${DRY_RUN ? ', DRY-RUN' : ''})`);
 
 const scan = catchUpScan();
 if (SCAN_ONLY) {
