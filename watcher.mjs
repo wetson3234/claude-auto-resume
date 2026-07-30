@@ -3,8 +3,8 @@
  * claude-auto-resume — watcher.mjs
  *
  * Watches a Claude Code session transcript (.jsonl) for usage-limit errors like:
- *   "You've hit your session limit · resets 6:50pm (Europe/Brussels)"
- *   "You've hit your weekly limit · resets 8pm (Europe/Brussels)"
+ *   "You've hit your session limit . resets 6:50pm (Europe/Brussels)"
+ *   "You've hit your weekly limit . resets 8pm (Europe/Brussels)"
  * Parses the reset time DYNAMICALLY (12h/24h, optional IANA timezone, DST-safe),
  * waits until reset + delay, then resumes the session with `claude --resume` so
  * interrupted background agents pick their work back up.
@@ -19,13 +19,26 @@
  *     session (e.g. relaunched by a scheduled task post-reboot), it scans the
  *     transcript tail, sees the session died on a limit, and schedules/resumes.
  *   - Single instance: a PID lockfile prevents duplicate watchers.
- *   - Model fallback (optional, on by default): instead of waiting for the reset,
- *     immediately resume on the next lower model tier (e.g. fable -> opus ->
- *     sonnet). The reset-time resume stays scheduled as a safety net and to
- *     restore the original model once the limit clears.
+ *   - Model fallback (opt-in, OFF by default): the real limit messages never
+ *     name a model or say whether the exhausted bar is specific to the
+ *     top-tier model vs a generic daily/weekly allowance shared across tiers
+ *     — that distinction is NOT observable from the transcript text (see
+ *     lib/detect.mjs). So the safe default is to WAIT for the reset; pass
+ *     --fallback (or set AUTO_RESUME_FALLBACK=1) to explicitly opt into
+ *     stepping down the tier chain (e.g. fable -> opus -> sonnet) instead,
+ *     accepting that risk. The reset-time resume always stays scheduled too,
+ *     as the safety net that restores the original model once the limit clears.
+ *   - Single-flight resumes: at most one `claude --resume <sessionId>` process
+ *     in flight per session at a time (lib/singleflight.mjs). A due schedule
+ *     that would spawn a second concurrent resume for the same session waits
+ *     instead of stacking on top of the one still running — this is what
+ *     used to produce up to 3 concurrent resume processes for one session.
  *   - Optional Telegram notifications (opt-in): if ~/.claude/auto-resume/notify.json
  *     exists, key events (limit detected, resume launched, resume finished) are
- *     pushed via the Telegram Bot API. Best-effort, deduplicated, never fatal.
+ *     pushed via the Telegram Bot API — one per REAL event (a new limit
+ *     episode, an actual tier escalation, a real spawn), never one per re-scan
+ *     of an already-known, still-open outage. Best-effort, deduplicated, never
+ *     fatal.
  *
  * Pure Node.js, zero dependencies, no AI involved.
  *
@@ -38,7 +51,8 @@
  * Flags:
  *   --dry-run            log what would happen, never spawn `claude`
  *   --scan-only          run the startup catch-up scan, print the decision, exit
- *   --no-fallback        disable model fallback (wait for reset instead)
+ *   --fallback           opt IN to model fallback (default: off — wait for reset)
+ *   --no-fallback        force fallback off (wins over --fallback / env)
  *   --fallback-chain a,b,c   override the tier chain (default: fable,opus,sonnet)
  *   --claude-bin <path>  explicit claude binary (else CLAUDE_BIN env, else where/which)
  *   --no-lock            skip the single-instance lockfile
@@ -47,19 +61,20 @@
  *   CLAUDE_BIN              claude binary path
  *   AUTO_RESUME_PROMPT      override the resume prompt
  *   AUTO_RESUME_EXTRA_ARGS  extra args appended to the claude command
- *   AUTO_RESUME_FALLBACK    "0"/"off" disables model fallback
+ *   AUTO_RESUME_FALLBACK    "1"/"on"/"true"/"yes" opts IN to model fallback (default: off)
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import {
   limitEventOf, recordModel, nextOccurrence, modelTier, nextFallbackTier,
-  DEFAULT_FALLBACK_CHAIN,
+  DEFAULT_FALLBACK_CHAIN, resolveFallbackEnabled, isNewEpisode, shouldNotifyLimitDetected,
 } from './lib/detect.mjs';
 import {
   loadNotifyConfig, createNotifier,
   formatLimitDetected, formatResumeStarted, formatResumeFinished,
 } from './lib/notify.mjs';
+import { resumeLockPath, isResumeInFlight } from './lib/singleflight.mjs';
 
 // ---------- args ----------
 const argv = process.argv.slice(2);
@@ -78,8 +93,11 @@ const ONCE = has('once');
 const DRY_RUN = has('dry-run');
 const SCAN_ONLY = has('scan-only');
 const NO_LOCK = has('no-lock');
-const FALLBACK_ENABLED = !has('no-fallback')
-  && !/^(0|off|false)$/i.test(process.env.AUTO_RESUME_FALLBACK || '');
+const FALLBACK_ENABLED = resolveFallbackEnabled({
+  noFallbackFlag: has('no-fallback'),
+  fallbackFlag: has('fallback'),
+  envValue: process.env.AUTO_RESUME_FALLBACK,
+});
 const FALLBACK_CHAIN = (arg('fallback-chain') || process.env.AUTO_RESUME_FALLBACK_CHAIN || '')
   .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
 const CHAIN = FALLBACK_CHAIN.length ? FALLBACK_CHAIN : DEFAULT_FALLBACK_CHAIN;
@@ -197,6 +215,28 @@ function saveState() {
   try { fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2)); } catch { /* best-effort */ }
 }
 
+// ---------------------------------------------------------------------------
+// Single-flight resume lock (fixes the documented bug: several fallback tiers
+// could each spawn their own `claude --resume <sameSessionId>` process without
+// cancelling/awaiting the one already in flight — up to 3 concurrent
+// processes observed for one session). Scoped by sessionId so it survives
+// --project-dir switching to a new transcript for the same logical session.
+// ---------------------------------------------------------------------------
+function resumeInFlight(sessionId) {
+  const lockPath = resumeLockPath(baseDir(), sessionId);
+  let raw;
+  try { raw = fs.readFileSync(lockPath, 'utf8'); } catch { return false; }
+  if (isResumeInFlight(raw, pidAlive)) return true;
+  try { fs.unlinkSync(lockPath); } catch { /* stale lock, already gone */ }
+  return false;
+}
+function markResumeInFlight(sessionId, pid) {
+  try { fs.writeFileSync(resumeLockPath(baseDir(), sessionId), JSON.stringify({ pid, at: Date.now() })); } catch { /* best-effort */ }
+}
+function clearResumeInFlight(sessionId) {
+  try { fs.unlinkSync(resumeLockPath(baseDir(), sessionId)); } catch { /* already gone */ }
+}
+
 function schedule(at, model, reason) {
   // Earliest-wins dedup: an equal-or-later schedule for the same model is a no-op.
   const dup = state.pending.find((p) => (p.model || null) === (model || null) && p.at <= at + 60000);
@@ -212,6 +252,10 @@ function schedule(at, model, reason) {
 // ---------- resume ----------
 function resumeSession(model = null) {
   const sessionId = path.basename(TRANSCRIPT, '.jsonl');
+  if (resumeInFlight(sessionId)) {
+    log(`resume SKIPPED — a resume for session ${sessionId} is already in flight (single-flight guard)`);
+    return;
+  }
   const modelArgs = model ? ['--model', model] : [];
   if (DRY_RUN) {
     log(`DRY-RUN: would resume session ${sessionId} (cwd=${CWD}, mode=${MODE}${model ? `, model=${model}` : ''})`);
@@ -221,6 +265,9 @@ function resumeSession(model = null) {
   telegram.notify(formatResumeStarted(sessionId, model));
   if (MODE === 'window' && process.platform === 'win32') {
     // New interactive terminal window resuming the session with the prompt.
+    // NOTE: we cannot track the new terminal's lifetime, so the single-flight
+    // lock only guards the headless (automatic, unattended) path below — the
+    // one that actually produced the concurrent-process bug.
     const argList = ['--resume', sessionId, ...modelArgs, PROMPT];
     const psList = argList.map((a) => `'${a.replace(/'/g, "''")}'`).join(',');
     const psArgs = ['-NoProfile', '-Command',
@@ -231,8 +278,10 @@ function resumeSession(model = null) {
     const args = ['--resume', sessionId, ...modelArgs, '-p', PROMPT, ...EXTRA_ARGS];
     const out = fs.openSync(path.join(baseDir(), 'auto-resume-run.log'), 'a');
     const child = spawn(CLAUDE_BIN, args, { cwd: CWD, detached: true, stdio: ['ignore', out, out] });
+    markResumeInFlight(sessionId, child.pid);
     // A resume failure must NEVER be silent: log + toast + persisted retry.
     child.on('exit', (code) => {
+      clearResumeInFlight(sessionId);
       telegram.notify(formatResumeFinished(code));
       if (code === 0) { log('resume finished successfully (exit 0)'); return; }
       log(`resume FAILED (exit ${code}) — see auto-resume-run.log`);
@@ -240,9 +289,10 @@ function resumeSession(model = null) {
       schedule(Date.now() + 5 * 60000, model, 'retry-after-failure');
     });
     child.on('error', (e) => {
+      clearResumeInFlight(sessionId);
       log(`resume spawn FAILED: ${e.message} (bin=${CLAUDE_BIN})`);
       notify('Claude auto-resume', `Could not launch claude (${e.message}).`);
-      telegram.notify('❌ Resume failed (could not launch claude)');
+      telegram.notify('Resume failed (could not launch claude)');
     });
   }
 }
@@ -268,7 +318,8 @@ function currentModelTier() {
 
 function handleLimitEvent(ev, origin) {
   const now = Date.now();
-  // Reset-time schedule (the guaranteed path).
+  // Reset-time schedule (the guaranteed path — this is now the DEFAULT and
+  // only behavior unless --fallback / AUTO_RESUME_FALLBACK opts in below).
   let resetAt;
   if (ev.reset) {
     resetAt = nextOccurrence(ev.reset.h, ev.reset.min, ev.reset.tz, ev.reset.weekday) + DELAY_MIN * 60000;
@@ -278,17 +329,29 @@ function handleLimitEvent(ev, origin) {
     log(`LIMIT detected (${origin}) — no parsable reset time, retrying hourly`);
   }
 
-  // Episode bookkeeping (one episode per limit outage).
-  if (!state.episode || now > (state.episode.resetAt || 0)) {
+  // Episode bookkeeping (one episode per limit outage). A re-detection of the
+  // SAME still-open episode (watcher restart, catch-up scan, or a fresh
+  // transcript after a resume that didn't clear the limit) must not re-notify
+  // or reset triedTiers — only a genuinely new episode does.
+  const isNewEp = isNewEpisode(state.episode, now);
+  if (isNewEp) {
     state.episode = { detectedAt: now, resetAt, triedTiers: [] };
   } else {
     state.episode.resetAt = Math.min(state.episode.resetAt, resetAt);
   }
 
   schedule(resetAt, null, 'reset');
-  notify('Claude auto-resume', `Limit hit — resume scheduled at ${new Date(resetAt).toLocaleTimeString(undefined, { hour12: false })}.`);
+  if (isNewEp) {
+    notify('Claude auto-resume', `Limit hit — resume scheduled at ${new Date(resetAt).toLocaleTimeString(undefined, { hour12: false })}.`);
+  } else {
+    log(`LIMIT re-detected (${origin}) for the same still-open episode — notification suppressed (anti-spam)`);
+  }
 
-  // Model fallback: don't wait — step down to the next lower tier immediately.
+  // Model fallback: OPT-IN ONLY (see lib/detect.mjs — the limit text never
+  // names a model, so we cannot reliably tell "this model's own bar is
+  // exhausted" apart from "a generic daily/weekly bar is exhausted"). Default
+  // behavior is to wait for the reset; this block is a no-op unless the human
+  // explicitly passed --fallback / AUTO_RESUME_FALLBACK=1.
   let fallbackTier = null;
   if (FALLBACK_ENABLED) {
     const { model, tier } = currentModelTier();
@@ -299,16 +362,20 @@ function handleLimitEvent(ev, origin) {
       fallbackTier = next;
       state.episode.triedTiers.push(next);
       saveState();
-      log(`model fallback: ${model || 'unknown model'} (tier ${fromTier || 'unknown'}) -> ${next} — resuming in 2 min instead of waiting`);
+      log(`model fallback (opt-in): ${model || 'unknown model'} (tier ${fromTier || 'unknown'}) -> ${next} — resuming in 2 min instead of waiting`);
       notify('Claude auto-resume', `Falling back to ${next} — resuming in 2 min instead of waiting for the reset.`);
       schedule(now + 2 * 60000, next, `fallback-${next}`);
-    } else {
+    } else if (isNewEp) {
       log('model fallback: chain exhausted — waiting for the reset');
     }
   }
-  telegram.notify(formatLimitDetected({
-    resetAt, tz: ev.reset?.tz || LOCAL_TZ, fallbackModel: fallbackTier,
-  }));
+  // One Telegram notification per REAL event: a brand new episode, or an
+  // actual tier escalation — never a plain re-scan of an already-known outage.
+  if (shouldNotifyLimitDetected(isNewEp, fallbackTier)) {
+    telegram.notify(formatLimitDetected({
+      resetAt, tz: ev.reset?.tz || LOCAL_TZ, fallbackModel: fallbackTier,
+    }));
+  }
   saveState();
 }
 
@@ -353,7 +420,7 @@ function catchUpScan() {
 }
 
 // ---------- startup ----------
-log(`started — watching ${TRANSCRIPT} (delay +${DELAY_MIN} min, mode ${MODE}, fallback ${FALLBACK_ENABLED ? CHAIN.join('>') : 'off'}, telegram ${telegram.enabled ? 'on' : 'off'}, claude=${CLAUDE_BIN}${DRY_RUN ? ', DRY-RUN' : ''})`);
+log(`started — watching ${TRANSCRIPT} (delay +${DELAY_MIN} min, mode ${MODE}, fallback ${FALLBACK_ENABLED ? CHAIN.join('>') : 'off (default — wait for reset)'}, telegram ${telegram.enabled ? 'on' : 'off'}, claude=${CLAUDE_BIN}${DRY_RUN ? ', DRY-RUN' : ''})`);
 
 const scan = catchUpScan();
 if (SCAN_ONLY) {
@@ -376,11 +443,12 @@ if (state.pending.length !== beforeCount) { log('dropped stale pending schedule(
 if (state.pending.length) {
   log(`restored ${state.pending.length} pending schedule(s) from state file`);
 }
-notify('Claude auto-resume', `Watcher active — session ${path.basename(TRANSCRIPT, '.jsonl').slice(0, 8)}… (resume at reset +${DELAY_MIN} min)`);
+notify('Claude auto-resume', `Watcher active — session ${path.basename(TRANSCRIPT, '.jsonl').slice(0, 8)}... (resume at reset +${DELAY_MIN} min)`);
 
 // ---------- tail loop ----------
 let lastSize = fs.statSync(TRANSCRIPT).size; // history handled by catchUpScan; tail only new lines
 let carry = '';
+let loggedInFlightWait = false; // avoid re-logging every tick while waiting on an in-flight resume
 
 setInterval(() => {
   // --project-dir mode: ALWAYS follow the newest session (headless resumes
@@ -404,12 +472,24 @@ setInterval(() => {
   // Fire due schedules (wall-clock check: survives sleep — after wake the next
   // tick compares Date.now() against the persisted target and fires if overdue).
   if (state.pending.length && Date.now() >= state.pending[0].at) {
-    const due = state.pending.shift();
-    saveState();
-    log(`firing scheduled resume [${due.reason}]${due.model ? ` (model ${due.model})` : ''}`);
-    resumeSession(due.model);
-    if (Date.now() > (state.episode?.resetAt || 0)) { state.episode = null; saveState(); }
-    if (ONCE) { log('--once mode: exiting.'); process.exit(0); }
+    const sessionId = path.basename(TRANSCRIPT, '.jsonl');
+    if (resumeInFlight(sessionId)) {
+      // A resume for this session is still running: wait for it instead of
+      // stacking a second concurrent `claude --resume` on top (the documented
+      // "up to 3 concurrent processes" bug). Log once per wait, not per tick.
+      if (!loggedInFlightWait) {
+        log(`resume already in flight for session ${sessionId} — waiting before firing the next schedule`);
+        loggedInFlightWait = true;
+      }
+    } else {
+      loggedInFlightWait = false;
+      const due = state.pending.shift();
+      saveState();
+      log(`firing scheduled resume [${due.reason}]${due.model ? ` (model ${due.model})` : ''}`);
+      resumeSession(due.model);
+      if (Date.now() > (state.episode?.resetAt || 0)) { state.episode = null; saveState(); }
+      if (ONCE) { log('--once mode: exiting.'); process.exit(0); }
+    }
   }
 
   // Tail new transcript content.
