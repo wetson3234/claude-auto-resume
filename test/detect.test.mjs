@@ -1,5 +1,5 @@
 /**
- * Unit tests for lib/detect.mjs — run with:  node --test test/
+ * Unit tests for lib/detect.mjs â€” run with:  node --test test/
  *
  * The first case is the EXACT message from a real incident (2026-07-28) where
  * the previous regex ("session|usage|rate limit" only) failed to match
@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import {
   isLimitText, parseResetSpec, limitEventOf, recordModel,
   nextOccurrence, modelTier, nextFallbackTier, DEFAULT_FALLBACK_CHAIN,
+  resolveFallbackEnabled, isNewEpisode, shouldNotifyLimitDetected,
 } from '../lib/detect.mjs';
 
 const TZ = 'Europe/Brussels';
@@ -54,7 +55,7 @@ for (const msg of MUST_NOT_MATCH) {
 }
 
 // ---------------------------------------------------------------------------
-// Reset-time parsing (DYNAMIC — hour/minute/tz all come from the message)
+// Reset-time parsing (DYNAMIC â€” hour/minute/tz all come from the message)
 // ---------------------------------------------------------------------------
 const RESET_CASES = [
   ["You've hit your weekly limit · resets 8pm (Europe/Brussels)", { h: 20, min: 0, tz: TZ }],
@@ -111,7 +112,7 @@ test('normal assistant record mentioning the phrase is NOT an event', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Target computation — reproduce the real incident
+// Target computation â€” reproduce the real incident
 // ---------------------------------------------------------------------------
 test('incident replay: limit at 05:03:58Z, resets 8pm Brussels -> 18:00 UTC same day', () => {
   // 2026-07-28 is CEST (UTC+2): 20:00 Europe/Brussels == 18:00 UTC.
@@ -158,4 +159,80 @@ test('transcript model extraction', () => {
   assert.equal(recordModel(JSON.stringify({ type: 'assistant', message: { model: 'claude-fable-5' } })), 'claude-fable-5');
   assert.equal(recordModel(JSON.stringify({ type: 'assistant', isApiErrorMessage: true, message: { model: '<synthetic>' } })), null);
   assert.equal(recordModel(JSON.stringify({ type: 'user', message: {} })), null);
+});
+
+// ---------------------------------------------------------------------------
+// Investigation finding (2026-07-30): top-tier-specific vs generic limits are
+// NOT distinguishable from the message text — no real message names a model.
+// This is a receipts test: if a future incident ever adds a model name to the
+// corpus above, this test forces a conscious re-evaluation of that finding.
+// ---------------------------------------------------------------------------
+test('real limit messages never name a model tier (proves the text cannot distinguish top-tier-specific vs generic limits)', () => {
+  const modelWords = /\b(fable|opus|sonnet|haiku)\b/i;
+  for (const msg of MUST_MATCH) {
+    assert.equal(modelWords.test(msg), false, `unexpected model mention in: "${msg}"`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Fallback opt-in resolution — default OFF (wait for reset), never a silent
+// automatic switch. See resolveFallbackEnabled doc comment for the rationale.
+// ---------------------------------------------------------------------------
+test('fallback resolution: no flags, no env -> off by default', () => {
+  assert.equal(resolveFallbackEnabled({}), false);
+  assert.equal(resolveFallbackEnabled({ noFallbackFlag: false, fallbackFlag: false, envValue: '' }), false);
+});
+test('fallback resolution: --fallback opts in', () => {
+  assert.equal(resolveFallbackEnabled({ fallbackFlag: true }), true);
+});
+test('fallback resolution: AUTO_RESUME_FALLBACK opts in (case-insensitive, several spellings)', () => {
+  for (const v of ['1', 'on', 'ON', 'true', 'True', 'yes']) {
+    assert.equal(resolveFallbackEnabled({ envValue: v }), true, `expected "${v}" to opt in`);
+  }
+});
+test('fallback resolution: unrecognized/empty env value stays off', () => {
+  for (const v of ['', '0', 'off', 'false', 'nope', undefined]) {
+    assert.equal(resolveFallbackEnabled({ envValue: v }), false, `expected "${v}" to stay off`);
+  }
+});
+test('fallback resolution: --no-fallback always wins, even over --fallback', () => {
+  assert.equal(resolveFallbackEnabled({ noFallbackFlag: true, fallbackFlag: true }), false);
+});
+test('fallback resolution: --no-fallback always wins, even over an enabling env var', () => {
+  assert.equal(resolveFallbackEnabled({ noFallbackFlag: true, envValue: '1' }), false);
+});
+
+// ---------------------------------------------------------------------------
+// Episode continuation vs new episode — gates re-notification and tier reset
+// ---------------------------------------------------------------------------
+test('isNewEpisode: no prior episode -> new', () => {
+  assert.equal(isNewEpisode(null, Date.now()), true);
+});
+test('isNewEpisode: prior episode still open (now before resetAt) -> not new', () => {
+  const now = 1_000_000;
+  assert.equal(isNewEpisode({ resetAt: now + 1 }, now), false);
+});
+test('isNewEpisode: prior episode resetAt exactly now -> not new (strict >)', () => {
+  const now = 1_000_000;
+  assert.equal(isNewEpisode({ resetAt: now }, now), false);
+});
+test('isNewEpisode: prior episode resetAt already passed -> new', () => {
+  const now = 1_000_000;
+  assert.equal(isNewEpisode({ resetAt: now - 1 }, now), true);
+});
+
+// ---------------------------------------------------------------------------
+// Notification gating — one per real event, not one per re-scan
+// ---------------------------------------------------------------------------
+test('shouldNotifyLimitDetected: new episode, no fallback -> notify', () => {
+  assert.equal(shouldNotifyLimitDetected(true, null), true);
+});
+test('shouldNotifyLimitDetected: re-detected episode, no fallback escalation -> silent', () => {
+  assert.equal(shouldNotifyLimitDetected(false, null), false);
+});
+test('shouldNotifyLimitDetected: re-detected episode WITH a fallback escalation -> notify', () => {
+  assert.equal(shouldNotifyLimitDetected(false, 'opus'), true);
+});
+test('shouldNotifyLimitDetected: new episode with fallback -> notify', () => {
+  assert.equal(shouldNotifyLimitDetected(true, 'opus'), true);
 });

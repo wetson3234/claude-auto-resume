@@ -60,10 +60,24 @@ On macOS/Linux the installer prints an equivalent cron line instead.
 - **Catch-up scan on startup** — if the session already died on a limit before the
   watcher (re)started, the transcript tail scan detects it and schedules the resume.
   If meaningful activity happened after the limit, the event is treated as stale.
-- **Model fallback** (on by default) — when the limit hits a high tier, immediately
-  resume on the next lower tier (default chain `fable → opus → sonnet`) instead of
-  waiting. The reset-time resume stays scheduled as a safety net and restores the
-  original model. Each tier is tried at most once per limit episode.
+- **Model fallback** (opt-in, OFF by default) — the real limit messages never name a
+  model or say whether the exhausted bar is specific to the top-tier model vs a
+  generic daily/weekly allowance shared across tiers; that distinction is **not
+  observable** from the transcript text. So the default is to **wait for the
+  reset**. Pass `--fallback` (or set `AUTO_RESUME_FALLBACK=1`) to explicitly opt
+  into stepping down the tier chain (default `fable → opus → sonnet`) instead,
+  accepting that risk. The reset-time resume always stays scheduled too, as the
+  safety net that restores the original model. Each tier is tried at most once per
+  limit episode.
+- **Single-flight resumes** — at most one `claude --resume <sessionId>` process in
+  flight per session at a time. A due schedule that would spawn a second concurrent
+  resume for the same session waits instead of stacking on top of the one still
+  running (this used to produce up to 3 concurrent resume processes for one
+  session when fallback and the reset-time safety net both fired close together).
+- **Notification anti-spam** — one notification per REAL event (a brand new limit
+  episode, an actual tier escalation, a real resume spawn/finish), never one per
+  re-scan of an already-known, still-open outage (watcher restart, catch-up scan,
+  or a fresh transcript after a resume that did not clear the limit).
 - **Never-silent failures** — a failed resume is logged, toasted, and retried via a
   persisted schedule.
 
@@ -108,7 +122,8 @@ node scripts/test-notify.mjs   # -> "🔔 Auto-resume notifications enabled" in 
 | `--delay-min <n>` | `5` | Minutes to wait **after** the reset time |
 | `--mode headless\|window` | `headless` | `headless` = `claude -p` in background · `window` = opens a new terminal (Windows) |
 | `--once` | off | Exit after the first resume |
-| `--no-fallback` | fallback on | Disable model fallback (wait for the reset instead) |
+| `--fallback` | off | Opt IN to model fallback (default: wait for the reset) |
+| `--no-fallback` | (n/a) | Force fallback off (wins over `--fallback` / env) |
 | `--fallback-chain a,b,c` | `fable,opus,sonnet` | Model tiers, high → low (substring-matched against model ids) |
 | `--claude-bin <path>` | auto | Explicit claude binary (else `CLAUDE_BIN`, else `where`/`which`) |
 | `--dry-run` | off | Log every decision, never spawn `claude` |
@@ -117,7 +132,8 @@ node scripts/test-notify.mjs   # -> "🔔 Auto-resume notifications enabled" in 
 
 Env vars: `CLAUDE_BIN`, `AUTO_RESUME_PROMPT` (custom resume prompt),
 `AUTO_RESUME_EXTRA_ARGS` (extra args appended to the `claude` command, e.g.
-`--permission-mode acceptEdits`), `AUTO_RESUME_FALLBACK` (`0`/`off` disables),
+`--permission-mode acceptEdits`), `AUTO_RESUME_FALLBACK` (`1`/`on`/`true`/`yes`
+opts IN to model fallback — default is off, wait for the reset),
 `AUTO_RESUME_FALLBACK_CHAIN`.
 
 ## Claude Code plugin (hook)
@@ -152,23 +168,36 @@ task above, which also survives reboots.
 ## Tests
 
 ```bash
-node --test test/detect.test.mjs test/notify.test.mjs
+node --test test/detect.test.mjs test/notify.test.mjs test/singleflight.test.mjs
 ```
 
-Covers the exact message from the 2026-07-28 incident (`weekly limit · resets 8pm`),
-EN/FR phrase variants, dynamic reset-time parsing (am/pm, 24h, `20h05`, weekday,
-timezone), real-event gating vs quotes, target-time computation across timezones,
-and the fallback chain. The notification tests (injected fetch/clock, no network)
-cover the absent-config no-op, message formatting, the Bot API call shape, the
-60 s dedup window, and best-effort failure handling (no throw, token never logged).
+83 tests. Covers the exact message from the 2026-07-28 incident (`weekly limit · resets
+8pm`), EN/FR phrase variants, dynamic reset-time parsing (am/pm, 24h, `20h05`, weekday,
+timezone), real-event gating vs quotes, target-time computation across timezones, the
+fallback chain, and a "receipts" test proving no real limit message ever names a model
+tier (2026-07-30 finding: top-tier-specific vs generic limits are not distinguishable
+from the text — see the Model fallback section above). Also covers fallback opt-in
+resolution (default off, `--no-fallback` always wins), episode continuation (a
+re-detected still-open outage must not re-notify or reset tried tiers), and
+notification gating (one notification per real event). The notification tests
+(injected fetch/clock, no network) cover the absent-config no-op, message formatting,
+the Bot API call shape, the 60 s dedup window, and best-effort failure handling (no
+throw, token never logged). The single-flight tests (lib/singleflight.mjs, injected
+liveness probe, no real process/filesystem) cover lock parsing and the exact guard
+that now prevents several fallback tiers from each spawning a concurrent
+`claude --resume` for the same session.
 
 ## Caveats
 
 - The resumed run continues the same conversation; your assistant should be instructed
   (via the resume prompt) to restart its interrupted background agents.
-- A weekly "all models" limit may also block fallback tiers; in that case the fallback
-  run dies on a fresh limit event, the watcher steps further down the chain, and once
-  exhausted it simply waits for the reset — the scheduled resume is always there.
+- Model fallback is opt-in for a reason: a real limit message never says whether the
+  exhausted bar is specific to the current model or a generic daily/weekly allowance
+  shared across tiers, so `--fallback` can end up stepping down through tiers that
+  are *also* rate-limited (e.g. a genuinely weekly "all models" limit). If you opt in
+  and that happens, the fallback run dies on a fresh limit event, the watcher steps
+  further down the chain, and once exhausted it simply waits for the reset — the
+  scheduled resume is always there regardless.
 - In `headless` mode, tools requiring interactive permission prompts may be limited by
   your permission settings — configure `AUTO_RESUME_EXTRA_ARGS` accordingly.
 - If the original interactive terminal is still open, the resumed continuation runs
@@ -182,10 +211,14 @@ Petit script Node sans dépendance ni IA : il surveille le transcript de ta sess
 Code, détecte le vrai événement de limite (« You've hit your weekly/session limit · resets
 8pm (fuseau) », variantes FR incluses), lit l'heure du reset dynamiquement, attend
 reset + 5 min, puis relance `claude --resume` pour que tes agents reprennent le travail
-tout seuls. Planification persistée (survit veille/reboot via tâche planifiée), repli
-automatique vers un modèle inférieur en attendant le reset, notifications Telegram
-optionnelles (opt-in via `~/.claude/auto-resume/notify.json`, hors repo), et outils
-`--dry-run` / `--scan-only` pour tester sans rien lancer.
+tout seuls. Planification persistée (survit veille/reboot via tâche planifiée), attente
+par défaut au prochain reset (le texte des messages de limite ne permet pas de savoir de
+maniere fiable si c'est une limite propre au modèle du moment ou une limite
+journalière/hebdomadaire partagée — donc plus de bascule de modèle automatique par
+défaut ; `--fallback` reste disponible en opt-in explicite), une seule reprise en vol
+par session (verrou anti-doublon), notifications Telegram optionnelles (opt-in via
+`~/.claude/auto-resume/notify.json`, hors repo, une notif par évènement réel), et
+outils `--dry-run` / `--scan-only` pour tester sans rien lancer.
 
 ## License
 
